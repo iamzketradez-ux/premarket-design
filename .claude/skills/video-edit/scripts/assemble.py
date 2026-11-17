@@ -36,6 +36,20 @@ def crop(z, cx, cy, sw, sh):
     return f'crop={w}:{h}:{x}:{y},'
 
 
+# iPhone and other phone cameras record HDR (HLG or PQ, BT.2020) by default. Cut straight to 8-bit without a tone map,
+# the picture comes out flat and washed, and the HDR tag left on aroll.mp4 pushes the renderer onto its slow HDR
+# path (about 3s a frame). So HDR sources are tone-mapped to SDR BT.709 here, from the original, before scaling.
+TONEMAP = ('zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,'
+           'zscale=t=bt709:m=bt709:r=tv,format=yuv420p,')
+SDR_TAGS = ['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-color_range', 'tv']
+
+
+def is_hdr(f):
+    trc = subprocess.run([FP, '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=color_transfer', '-of', 'csv=p=0', f],
+                         **skillenv.TEXT).stdout.strip().split(',')[0]
+    return trc in ('arib-std-b67', 'smpte2084')
+
+
 def frames(f):
     return int(subprocess.run([FP, '-v', 'error', '-count_frames', '-select_streams', 'v:0', '-show_entries', 'stream=nb_read_frames',
                                '-of', 'csv=p=0', f], **skillenv.TEXT).stdout.strip().split(',')[0])
@@ -60,11 +74,12 @@ def main():
         out = os.path.join(work, f'seg_{k}.mp4')
         # vertical fill: scale to cover 1080x1920 then centre-crop (handles 4K 9:16 and odd phone sizes)
         vf = (f"{crop(s.get('zoom', 1), s.get('cx', .5), s.get('cy', .5), sw, sh)}"
+              f"{TONEMAP if is_hdr(f) else ''}"
               'scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920,fps=30')
         subprocess.run([FF, '-loglevel', 'error', '-y', '-ss', f"{s['in']:.3f}", '-t', f'{d:.3f}', '-i', f,
                         '-map', '0:v:0', '-map', '0:a:0', '-vf', vf,
                         '-af', f'afade=t=in:d=0.02,afade=t=out:st={d - 0.03:.3f}:d=0.03',   # no clicks at the joins
-                        '-c:v', 'libx264', '-crf', '14', '-preset', 'medium', '-pix_fmt', 'yuv420p',
+                        '-c:v', 'libx264', '-crf', '14', '-preset', 'medium', '-pix_fmt', 'yuv420p', *SDR_TAGS,
                         '-c:a', 'pcm_s16le', '-ar', '48000', out], check=True)
         parts.append(out)
         meta.append({**s, 'src_in': s['in'], 'src_out': s['out']})
@@ -74,7 +89,7 @@ def main():
         fh.write(''.join(skillenv.concat_entry(os.path.basename(p)) for p in parts))
     subprocess.run([FF, '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', concat,
                     '-vf', 'setpts=N/30/TB', '-r', '30', '-fps_mode', 'cfr', '-af', 'asetpts=PTS-STARTPTS',
-                    '-c:v', 'libx264', '-crf', '14', '-preset', 'medium', '-g', '30', '-keyint_min', '30', '-pix_fmt', 'yuv420p',
+                    '-c:v', 'libx264', '-crf', '14', '-preset', 'medium', '-g', '30', '-keyint_min', '30', '-pix_fmt', 'yuv420p', *SDR_TAGS,
                     '-c:a', 'aac', '-b:a', '192k', aroll], check=True)
     fr = 0
     for k, m in enumerate(meta):
